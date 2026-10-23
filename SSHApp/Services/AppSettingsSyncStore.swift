@@ -166,6 +166,7 @@ final class AppSettingsSyncStore {
             setting(AppSettingsKey.tmuxPauseModeEnabled, kind: .bool),
             setting(AppSettingsKey.tmuxScrollbackLines, kind: .int),
             setting(AppSettingsKey.tmuxPauseAfterSeconds, kind: .int),
+            setting(AppSettingsKey.tmuxClipboardSyncEnabled, kind: .bool),
             setting(AppSettingsKey.terminalLightTheme, kind: .string),
             setting(AppSettingsKey.terminalDarkTheme, kind: .string),
             setting(AppSettingsKey.terminalFontFamily, kind: .string),

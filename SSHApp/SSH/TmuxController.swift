@@ -9,6 +9,7 @@
 
 import Foundation
 import os
+import UIKit
 
 private let logger = Logger(subsystem: "dev.sshapp.sshapp.tmux", category: "controller")
 
@@ -80,6 +81,10 @@ final class TmuxController {
     // MARK: - Dependencies
 
     let gateway: TmuxGateway
+
+    /// Receives tmux paste-buffer contents bound for the device clipboard.
+    @ObservationIgnored
+    private let pasteboardWriter: @MainActor (String) -> Void
 
     // MARK: - Internal
 
@@ -164,6 +169,18 @@ final class TmuxController {
     @ObservationIgnored
     private var serverHistoryLimit: Int?
 
+    /// Whether tmux treats this control client as UTF-8, probed on the first
+    /// paste-buffer change. A non-UTF-8 client gets `show-buffer` output with
+    /// tabs, newlines and non-ASCII replaced by `_` (verified against tmux 3.4),
+    /// so its buffers must never reach the clipboard.
+    @ObservationIgnored
+    private var clientSupportsUTF8: Bool?
+
+    /// Latest-wins token for paste-buffer clipboard sync: a slower `show-buffer`
+    /// for an older copy must not overwrite the clipboard after a newer one.
+    @ObservationIgnored
+    private var pasteBufferSyncGeneration = 0
+
     /// The version every feature gate is decided against.
     ///
     /// Routed through one accessor because the gates used to disagree about what
@@ -183,9 +200,14 @@ final class TmuxController {
 
     // MARK: - Init
 
-    init(gateway: TmuxGateway, settings: TmuxSettings = .default) {
+    init(
+        gateway: TmuxGateway,
+        settings: TmuxSettings = .default,
+        pasteboardWriter: @escaping @MainActor (String) -> Void = { UIPasteboard.general.string = $0 }
+    ) {
         self.gateway = gateway
         self.settings = settings
+        self.pasteboardWriter = pasteboardWriter
     }
 
     // MARK: - Attach sequence
@@ -943,6 +965,44 @@ final class TmuxController {
             }
         }
         return "\"\(escaped)\""
+    }
+
+    // MARK: - Clipboard sync
+
+    /// Copy a changed tmux paste buffer to the device clipboard.
+    ///
+    /// In control mode tmux key bindings never see our keystrokes (they arrive
+    /// via `send-keys`), so `prefix ]` cannot paste and a copy-mode selection is
+    /// otherwise stranded in tmux. Mirroring the buffer lets the system paste
+    /// path reach it. Runs off the event loop: awaiting a command response
+    /// inside `processEvent` would block the gateway from delivering it.
+    private func syncPasteBufferToClipboard(named name: String) {
+        guard settings.clipboardSyncEnabled else { return }
+        pasteBufferSyncGeneration += 1
+        let generation = pasteBufferSyncGeneration
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                if self.clientSupportsUTF8 == nil {
+                    let probe = try await self.gateway.sendCommand("display-message -p \"#{client_utf8}\"")
+                    self.clientSupportsUTF8 = probe.bodyString
+                        .trimmingCharacters(in: .whitespacesAndNewlines) == "1"
+                }
+                guard self.clientSupportsUTF8 == true else {
+                    logger.info("tmux client is not UTF-8; skipping clipboard sync")
+                    return
+                }
+                let response = try await self.gateway.sendCommand(
+                    "show-buffer -b \(Self.tmuxDoubleQuoted(name))"
+                )
+                // Lossy decoding would clobber the clipboard with "" or junk.
+                guard generation == self.pasteBufferSyncGeneration, !response.isError,
+                      let text = String(data: response.body, encoding: .utf8) else { return }
+                self.pasteboardWriter(text)
+            } catch {
+                logger.warning("paste buffer sync failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     // MARK: - Pause recovery
@@ -1952,12 +2012,14 @@ final class TmuxController {
             }
             logger.info("tmux message: \(trimmed, privacy: .public)")
 
+        case .pasteBufferChanged(let name):
+            syncPasteBufferToClipboard(named: name)
+
         case .commandResponse,
              .sessionsChanged,
              .unlinkedWindowAdd,
              .paneModeChanged,
              .subscriptionChanged,
-             .pasteBufferChanged,
              .pasteBufferDeleted,
              .configError:
             break

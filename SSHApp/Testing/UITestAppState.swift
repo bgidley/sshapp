@@ -143,6 +143,7 @@ enum UITestAppState {
             AppSettingsKey.tmuxPauseModeEnabled,
             AppSettingsKey.tmuxScrollbackLines,
             AppSettingsKey.tmuxPauseAfterSeconds,
+            AppSettingsKey.tmuxClipboardSyncEnabled,
             AppSettingsKey.terminalLightTheme,
             AppSettingsKey.terminalDarkTheme,
             AppSettingsKey.terminalFontFamily,

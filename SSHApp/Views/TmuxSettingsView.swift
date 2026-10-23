@@ -7,6 +7,7 @@ struct TmuxSettingsView: View {
     @AppStorage(AppSettingsKey.tmuxPauseModeEnabled) private var pauseModeEnabled = true
     @AppStorage(AppSettingsKey.tmuxScrollbackLines) private var scrollbackLines = 5000
     @AppStorage(AppSettingsKey.tmuxPauseAfterSeconds) private var pauseAfterSeconds = 30
+    @AppStorage(AppSettingsKey.tmuxClipboardSyncEnabled) private var clipboardSyncEnabled = true
 
     private var palette: AppPalette { TerminalRuntime.shared.appPalette }
 
@@ -24,6 +25,15 @@ struct TmuxSettingsView: View {
                         .accessibilityIdentifier("tmux.settings.backfill")
                     Toggle("Pause-mode (tmux 3.2+)", isOn: $pauseModeEnabled)
                         .accessibilityIdentifier("tmux.settings.pauseMode")
+                }
+
+                Section {
+                    Toggle("Copy tmux buffers to clipboard", isOn: $clipboardSyncEnabled)
+                        .accessibilityIdentifier("tmux.settings.clipboardSync")
+                } header: {
+                    Text("Clipboard")
+                } footer: {
+                    Text("When tmux copies text (copy mode, mouse selection, set-buffer), it is placed on the device clipboard so it can be pasted anywhere. Programs on the server can also set tmux buffers.")
                 }
 
                 Section("Backfill") {

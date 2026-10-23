@@ -456,6 +456,7 @@ struct TmuxSettings: Sendable, Equatable {
     var pauseModeEnabled: Bool = true
     var scrollbackLines: Int = 5000
     var pauseAfterSeconds: Int = 30
+    var clipboardSyncEnabled: Bool = true
 
     static let `default` = TmuxSettings()
 }

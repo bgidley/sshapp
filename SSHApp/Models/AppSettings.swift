@@ -25,6 +25,7 @@ enum AppSettingsKey {
     static let tmuxPauseModeEnabled = "tmux.pauseModeEnabled"
     static let tmuxScrollbackLines = "tmux.scrollbackLines"
     static let tmuxPauseAfterSeconds = "tmux.pauseAfterSeconds"
+    static let tmuxClipboardSyncEnabled = "tmux.clipboardSyncEnabled"
 
     // Terminal appearance — names of the selected Ghostty color themes for
     // light/dark mode (see GhosttyThemeCatalog).
@@ -446,6 +447,10 @@ extension TmuxSettings {
         s.pauseAfterSeconds = defaults.tmuxInt(
             AppSettingsKey.tmuxPauseAfterSeconds,
             default: s.pauseAfterSeconds
+        )
+        s.clipboardSyncEnabled = defaults.tmuxBool(
+            AppSettingsKey.tmuxClipboardSyncEnabled,
+            default: s.clipboardSyncEnabled
         )
         return s
     }
