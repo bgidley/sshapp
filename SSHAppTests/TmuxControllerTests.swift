@@ -479,14 +479,15 @@ final class TmuxControllerTests: XCTestCase {
         gateway: TmuxGateway,
         controller: TmuxController,
         writer: RecordingWriter,
-        paneID: TmuxPaneID
+        paneID: TmuxPaneID,
+        version: String = "2.9"
     ) async throws {
         let attachTask = Task { await controller.attach(initialCols: 62, initialRows: 49) }
 
         try await waitUntil("version probe command is written") {
             writer.capturedString.contains("display-message -p \"#{version}")
         }
-        await feedResponse(to: gateway, commandNumber: 1, body: "2.9\tssh-app-session")
+        await feedResponse(to: gateway, commandNumber: 1, body: "\(version)\tssh-app-session")
 
         try await waitUntil("list-windows command is written") {
             writer.capturedString.contains("list-windows -F")
@@ -3112,9 +3113,13 @@ final class TmuxControllerTests: XCTestCase {
         var writes: [String] = []
     }
 
+    /// Attach (bootstrap uses commands 1–5) so feature gates see `version`.
+    /// The gateway holds its delegate weakly: callers must keep `controller`
+    /// alive or the notifications under test are never delivered.
     private func makeClipboardStack(
+        version: String,
         clipboardSyncEnabled: Bool = true
-    ) async -> (TmuxGateway, TmuxController, RecordingWriter, RecordingPasteboard) {
+    ) async throws -> (TmuxGateway, TmuxController, RecordingWriter, RecordingPasteboard) {
         let writer = RecordingWriter()
         let pasteboard = RecordingPasteboard()
         let gateway = TmuxGateway(writer: { data in try await writer.write(data) })
@@ -3125,9 +3130,15 @@ final class TmuxControllerTests: XCTestCase {
             settings: settings,
             pasteboardWriter: { pasteboard.writes.append($0) }
         )
-        // The gateway holds its delegate weakly: callers must keep `controller`
-        // alive or the notifications under test are never delivered.
         await gateway.setDelegate(controller)
+        try await attachMinimalSinglePaneSession(
+            gateway: gateway,
+            controller: controller,
+            writer: writer,
+            paneID: TmuxPaneID(rawValue: 61),
+            version: version
+        )
+        writer.reset()
         return (gateway, controller, writer, pasteboard)
     }
 
@@ -3136,20 +3147,21 @@ final class TmuxControllerTests: XCTestCase {
     /// `%paste-buffer-changed` notification was ignored and `prefix ]` cannot
     /// paste. The buffer must reach the device clipboard byte-for-byte.
     func testPasteBufferChangeCopiesBufferToClipboard() async throws {
-        let (gateway, controller, writer, pasteboard) = await makeClipboardStack()
+        let (gateway, controller, writer, pasteboard) = try await makeClipboardStack(version: "3.4")
 
         await gateway.feedLine(Data("%paste-buffer-changed buffer0".utf8))
         try await waitUntil("UTF-8 probe is written") {
             writer.capturedString.contains("display-message -p \"#{client_utf8}\"")
         }
-        await feedResponse(to: gateway, commandNumber: 1, body: "1")
+        await feedResponse(to: gateway, commandNumber: 6, body: "1")
         try await waitUntil("show-buffer is written") {
             writer.capturedString.contains("show-buffer -b \"buffer0\"\n")
         }
-        await feedResponse(to: gateway, commandNumber: 2, body: "a\tb é\nline2\n")
+        // tmux 3.4+ prints raw bytes: a literal backslash must survive.
+        await feedResponse(to: gateway, commandNumber: 7, body: "a\tb é \\t\nline2\n")
         try await waitUntil("clipboard is written") { !pasteboard.writes.isEmpty }
 
-        XCTAssertEqual(pasteboard.writes, ["a\tb é\nline2\n"])
+        XCTAssertEqual(pasteboard.writes, ["a\tb é \\t\nline2\n"])
 
         // The UTF-8 probe is cached: a second copy goes straight to show-buffer.
         writer.reset()
@@ -3158,7 +3170,7 @@ final class TmuxControllerTests: XCTestCase {
             writer.capturedString.contains("show-buffer -b \"buffer1\"\n")
         }
         XCTAssertFalse(writer.capturedString.contains("client_utf8"))
-        await feedResponse(to: gateway, commandNumber: 3, body: "next")
+        await feedResponse(to: gateway, commandNumber: 8, body: "next")
         try await waitUntil("second clipboard write") { pasteboard.writes.count == 2 }
         XCTAssertEqual(pasteboard.writes.last, "next")
         withExtendedLifetime(controller) {}
@@ -3167,13 +3179,13 @@ final class TmuxControllerTests: XCTestCase {
     /// A non-UTF-8 control client gets `show-buffer` output with tabs, newlines
     /// and non-ASCII replaced by `_`; that must never overwrite the clipboard.
     func testPasteBufferChangeSkipsClipboardForNonUTF8Client() async throws {
-        let (gateway, controller, writer, pasteboard) = await makeClipboardStack()
+        let (gateway, controller, writer, pasteboard) = try await makeClipboardStack(version: "3.4")
 
         await gateway.feedLine(Data("%paste-buffer-changed buffer0".utf8))
         try await waitUntil("UTF-8 probe is written") {
             writer.capturedString.contains("#{client_utf8}")
         }
-        await feedResponse(to: gateway, commandNumber: 1, body: "0")
+        await feedResponse(to: gateway, commandNumber: 6, body: "0")
         try await Task.sleep(nanoseconds: 100_000_000)
 
         XCTAssertFalse(writer.capturedString.contains("show-buffer"))
@@ -3182,9 +3194,14 @@ final class TmuxControllerTests: XCTestCase {
     }
 
     func testPasteBufferChangeIgnoredWhenClipboardSyncDisabled() async throws {
-        let (gateway, controller, writer, pasteboard) = await makeClipboardStack(clipboardSyncEnabled: false)
+        let (gateway, controller, writer, pasteboard) = try await makeClipboardStack(
+            version: "3.3a",
+            clipboardSyncEnabled: false
+        )
 
         await gateway.feedLine(Data("%paste-buffer-changed buffer0".utf8))
+        await gateway.feedLine(Data("%pane-mode-changed %61".utf8))
+        await gateway.feedLine(Data("%pane-mode-changed %61".utf8))
         try await Task.sleep(nanoseconds: 100_000_000)
 
         XCTAssertEqual(writer.capturedString, "")
@@ -3193,18 +3210,105 @@ final class TmuxControllerTests: XCTestCase {
     }
 
     func testPasteBufferNameIsQuotedForTmux() async throws {
-        let (gateway, controller, writer, _) = await makeClipboardStack()
+        let (gateway, controller, writer, _) = try await makeClipboardStack(version: "3.4")
 
         await gateway.feedLine(Data("%paste-buffer-changed $HOME".utf8))
         try await waitUntil("UTF-8 probe is written") {
             writer.capturedString.contains("#{client_utf8}")
         }
-        await feedResponse(to: gateway, commandNumber: 1, body: "1")
+        await feedResponse(to: gateway, commandNumber: 6, body: "1")
         try await waitUntil("show-buffer is written") {
             writer.capturedString.contains("show-buffer")
         }
         XCTAssertTrue(writer.capturedString.contains("show-buffer -b \"\\$HOME\"\n"))
         withExtendedLifetime(controller) {}
+    }
+
+    /// Regression: tmux before 3.4 never sends `%paste-buffer-changed`, so on
+    /// tmux 3.3a nothing reached the clipboard. Leaving copy mode (which a
+    /// copy-and-cancel or mouse drag does) must sync a new newest buffer.
+    func testLegacyTmuxSyncsNewBufferWhenPaneLeavesCopyMode() async throws {
+        let (gateway, controller, writer, pasteboard) = try await makeClipboardStack(version: "3.3a")
+
+        // Entering copy mode records the baseline without touching the clipboard.
+        await gateway.feedLine(Data("%pane-mode-changed %61".utf8))
+        try await waitUntil("baseline listing is written") {
+            writer.capturedString.contains("list-buffers -F \"#{buffer_name}\\t#{buffer_created}\\t#{buffer_size}\"\n")
+        }
+        await feedResponse(to: gateway, commandNumber: 6, body: "buffer0\t1700000000\t3")
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertFalse(writer.capturedString.contains("show-buffer"))
+
+        // Leaving copy mode after a copy: a new newest buffer is synced.
+        writer.reset()
+        await gateway.feedLine(Data("%pane-mode-changed %61".utf8))
+        try await waitUntil("second listing is written") {
+            writer.capturedString.contains("list-buffers")
+        }
+        await feedResponse(
+            to: gateway,
+            commandNumber: 7,
+            body: "buffer1\t1700000005\t21\nbuffer0\t1700000000\t3"
+        )
+        try await waitUntil("UTF-8 probe is written") {
+            writer.capturedString.contains("#{client_utf8}")
+        }
+        await feedResponse(to: gateway, commandNumber: 8, body: "1")
+        try await waitUntil("show-buffer is written") {
+            writer.capturedString.contains("show-buffer -b \"buffer1\"\n")
+        }
+        // tmux 3.3a vis-encodes show-buffer output.
+        await feedResponse(to: gateway, commandNumber: 9, body: "a\\tb \\\\x \\$HOME\nline2\n")
+        try await waitUntil("clipboard is written") { !pasteboard.writes.isEmpty }
+
+        XCTAssertEqual(pasteboard.writes, ["a\tb \\x $HOME\nline2\n"])
+        withExtendedLifetime(controller) {}
+    }
+
+    func testLegacyTmuxDoesNotSyncUnchangedBuffer() async throws {
+        let (gateway, controller, writer, pasteboard) = try await makeClipboardStack(version: "3.3a")
+
+        // Entering and leaving copy mode without copying: same newest buffer.
+        await gateway.feedLine(Data("%pane-mode-changed %61".utf8))
+        try await waitUntil("baseline listing is written") {
+            writer.capturedString.contains("list-buffers")
+        }
+        await feedResponse(to: gateway, commandNumber: 6, body: "buffer0\t1700000000\t3")
+        writer.reset()
+        await gateway.feedLine(Data("%pane-mode-changed %61".utf8))
+        try await waitUntil("second listing is written") {
+            writer.capturedString.contains("list-buffers")
+        }
+        await feedResponse(to: gateway, commandNumber: 7, body: "buffer0\t1700000000\t3")
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertFalse(writer.capturedString.contains("show-buffer"))
+        XCTAssertTrue(pasteboard.writes.isEmpty)
+        withExtendedLifetime(controller) {}
+    }
+
+    /// tmux 3.4+ reports buffer changes itself; copy-mode transitions must not
+    /// add a buffer listing per transition.
+    func testModernTmuxIgnoresPaneModeChangesForClipboard() async throws {
+        let (gateway, controller, writer, _) = try await makeClipboardStack(version: "3.4")
+
+        await gateway.feedLine(Data("%pane-mode-changed %61".utf8))
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertFalse(writer.capturedString.contains("list-buffers"))
+        withExtendedLifetime(controller) {}
+    }
+
+    /// Bytes captured from tmux 3.3a `show-buffer` for the buffer
+    /// "a\tb é\\x $HOME ${X} $1\nline2\r\u{01}\u{00}1 end\n".
+    func testDecodeVisEncodedBufferMatchesTmux33a() {
+        let encoded = Data(#"a\tb é\\x \$HOME \${X} $1"#.utf8)
+            + Data("\n".utf8)
+            + Data(#"line2\r\001\0001 end"#.utf8)
+            + Data("\n".utf8)
+        let expected = Data("a\tb é\\x $HOME ${X} $1\nline2\r\u{01}\u{00}1 end\n".utf8)
+
+        XCTAssertEqual(TmuxController.decodeVisEncodedBuffer(encoded), expected)
     }
 
     func testClipboardSyncSettingDefaultsOnAndHonoursStoredValue() throws {

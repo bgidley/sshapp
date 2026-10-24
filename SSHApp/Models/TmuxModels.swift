@@ -153,6 +153,14 @@ struct TmuxVersion: Comparable, Hashable, Sendable, CustomStringConvertible {
 
     /// `refresh-client -C @WINDOW:WxH` per-window variable size.
     var supportsVariableWindowSize: Bool { self >= TmuxVersion(major: 3, minor: 0) }
+
+    /// `%paste-buffer-changed` notifications. Earlier releases send nothing
+    /// when a buffer is set (verified against tmux 3.3a).
+    var supportsPasteBufferNotifications: Bool { self >= TmuxVersion(major: 3, minor: 4) }
+
+    /// `show-buffer` prints raw bytes to control clients. Earlier releases
+    /// vis-encode them (tabs, controls, `\\` and some `$` escaped).
+    var showBufferPrintsRawBytes: Bool { self >= TmuxVersion(major: 3, minor: 4) }
 }
 
 // MARK: - Window Flags

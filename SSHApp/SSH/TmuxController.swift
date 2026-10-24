@@ -181,6 +181,12 @@ final class TmuxController {
     @ObservationIgnored
     private var pasteBufferSyncGeneration = 0
 
+    /// Newest paste buffer's `name\tcreated\tsize`, for tmux without
+    /// `%paste-buffer-changed`. Nil until the first copy-mode transition
+    /// records a baseline, so attaching never copies a stale buffer.
+    @ObservationIgnored
+    private var newestPasteBufferKey: String?
+
     /// The version every feature gate is decided against.
     ///
     /// Routed through one accessor because the gates used to disagree about what
@@ -995,14 +1001,89 @@ final class TmuxController {
                 let response = try await self.gateway.sendCommand(
                     "show-buffer -b \(Self.tmuxDoubleQuoted(name))"
                 )
+                let body = self.effectiveVersion.showBufferPrintsRawBytes
+                    ? response.body
+                    : Self.decodeVisEncodedBuffer(response.body)
                 // Lossy decoding would clobber the clipboard with "" or junk.
                 guard generation == self.pasteBufferSyncGeneration, !response.isError,
-                      let text = String(data: response.body, encoding: .utf8) else { return }
+                      let text = String(data: body, encoding: .utf8) else { return }
                 self.pasteboardWriter(text)
             } catch {
                 logger.warning("paste buffer sync failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    /// Fallback for tmux before 3.4, which never reports buffer changes.
+    ///
+    /// Copy-mode copies (`copy-selection-and-cancel`, mouse drag end) leave
+    /// copy mode, which tmux does report as `%pane-mode-changed`. On each
+    /// transition, compare the newest buffer with the last one seen and sync
+    /// it when it is new. Entering copy mode always precedes the copy, so the
+    /// first transition records the baseline.
+    private func syncNewestPasteBufferIfChanged() {
+        guard settings.clipboardSyncEnabled else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                // tmux lists buffers newest first.
+                let response = try await self.gateway.sendCommand(
+                    "list-buffers -F \"#{buffer_name}\\t#{buffer_created}\\t#{buffer_size}\""
+                )
+                let newest = response.bodyLines.first ?? ""
+                let previous = self.newestPasteBufferKey
+                self.newestPasteBufferKey = newest
+                guard let previous, newest != previous,
+                      let name = newest.split(separator: "\t").first.map(String.init),
+                      !name.isEmpty else { return }
+                self.syncPasteBufferToClipboard(named: name)
+            } catch {
+                logger.warning("paste buffer listing failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Undo the `strvis(VIS_OCTAL|VIS_CSTYLE|VIS_TAB)` encoding tmux before 3.4
+    /// applies to `show-buffer` output: `\\`, `\$`, C-style escapes and
+    /// three-digit octal bytes. Newlines and valid UTF-8 pass through raw.
+    static func decodeVisEncodedBuffer(_ data: Data) -> Data {
+        let bytes = [UInt8](data)
+        var decoded = Data()
+        decoded.reserveCapacity(bytes.count)
+        func isOctal(_ index: Int) -> Bool {
+            index < bytes.count && (0x30...0x37).contains(bytes[index])
+        }
+        var i = 0
+        while i < bytes.count {
+            let byte = bytes[i]
+            guard byte == 0x5C, i + 1 < bytes.count else {
+                decoded.append(byte)
+                i += 1
+                continue
+            }
+            if isOctal(i + 1), isOctal(i + 2), isOctal(i + 3) {
+                let value = (Int(bytes[i + 1]) - 0x30) << 6
+                    | (Int(bytes[i + 2]) - 0x30) << 3
+                    | (Int(bytes[i + 3]) - 0x30)
+                decoded.append(UInt8(truncatingIfNeeded: value))
+                i += 4
+                continue
+            }
+            switch bytes[i + 1] {
+            case UInt8(ascii: "n"): decoded.append(0x0A)
+            case UInt8(ascii: "r"): decoded.append(0x0D)
+            case UInt8(ascii: "t"): decoded.append(0x09)
+            case UInt8(ascii: "b"): decoded.append(0x08)
+            case UInt8(ascii: "a"): decoded.append(0x07)
+            case UInt8(ascii: "v"): decoded.append(0x0B)
+            case UInt8(ascii: "f"): decoded.append(0x0C)
+            case UInt8(ascii: "s"): decoded.append(0x20)
+            case UInt8(ascii: "0"): decoded.append(0x00)
+            default: decoded.append(bytes[i + 1])  // `\\`, `\$`
+            }
+            i += 2
+        }
+        return decoded
     }
 
     // MARK: - Pause recovery
@@ -2015,10 +2096,14 @@ final class TmuxController {
         case .pasteBufferChanged(let name):
             syncPasteBufferToClipboard(named: name)
 
+        case .paneModeChanged:
+            if !effectiveVersion.supportsPasteBufferNotifications {
+                syncNewestPasteBufferIfChanged()
+            }
+
         case .commandResponse,
              .sessionsChanged,
              .unlinkedWindowAdd,
-             .paneModeChanged,
              .subscriptionChanged,
              .pasteBufferDeleted,
              .configError:
